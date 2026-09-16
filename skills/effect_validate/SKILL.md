@@ -1,89 +1,162 @@
 # Effect Validate
 
-Validate and fix Lua light effect scripts by running them in Code Interpreter.
+Validate Lua light effect scripts by submitting them to the remote light-effect
+validation API. The API checks the script and, on success, renders a preview GIF
+whose URL is returned to the user.
+
+## CRITICAL: never fake validation
+
+This skill validates a script by calling the REMOTE API below. That is the ONLY
+acceptable way to validate. You MUST NOT substitute a local simulation, a
+Code-Interpreter mock harness, or your own judgement for the real API call.
+
+- If the API returns a result, report exactly what it says.
+- If the API cannot be reached (network error, non-200, timeout, malformed
+  response), you MUST tell the user the validation service is unreachable and
+  that the script is therefore **UNVERIFIED**. Never say or imply the script
+  "passed" / "校验通过" when the real API did not return valid=true.
+- Do NOT fall back to a local Lua/Python simulation and present its result as if
+  it were the validation outcome. "Unverified" is an acceptable honest answer;
+  a fake pass is not.
 
 ## When to Use
 
 - After generating or modifying any effect (automatic)
-- When user explicitly asks to validate/check a script
-- When user reports a script isn't working
+- When the user explicitly asks to validate/check a script
+- When the user reports a script isn't working
+- Invoked via the `/validate` command
 
-## Validation Steps
+## The Validation API
 
-### Step 1: Syntax Check
+- **URL**: `https://d1vsg15w9yes9v.cloudfront.net/api/light-effect/check-and-render`
+- **Method**: `POST`
+- **Content-Type**: `application/json`
+- **Request body**:
 
-Verify the script has:
-- [ ] Metadata block `--[=[` ... `--]=]` present
-- [ ] Metadata is valid JSON on a single line
-- [ ] Required metadata fields: applicationId, minSdkVersion, version, frameDuration, comment
-- [ ] `onRender(ctx, index)` function defined
-- [ ] Returns a Color value (Color.RGB or Color.HSV)
-
-### Step 2: Runtime Execution
-
-Run the script with the test harness (100 pixels, 10 frames):
-
-```lua
--- Color mock
-Color = {
-    RGB = function(r, g, b)
-        r = math.floor(r); g = math.floor(g); b = math.floor(b)
-        assert(r >= 0 and r <= 255, "R out of range: " .. tostring(r))
-        assert(g >= 0 and g <= 255, "G out of range: " .. tostring(g))
-        assert(b >= 0 and b <= 255, "B out of range: " .. tostring(b))
-        return {r=r, g=g, b=b, type="rgb"}
-    end,
-    HSV = function(h, s, v)
-        assert(h >= 0 and h <= 1, "H out of range: " .. tostring(h))
-        assert(s >= 0 and s <= 1, "S out of range: " .. tostring(s))
-        assert(v >= 0 and v <= 1, "V out of range: " .. tostring(v))
-        return {h=h, s=s, v=v, type="hsv"}
-    end
-}
-
--- WaveForm mock
-WaveForm = {
-    Wave = function(v) return (math.sin(v * 2 * math.pi) + 1) / 2 end,
-    Triangle = function(v) v = v % 1; return v < 0.5 and v * 2 or (1 - v) * 2 end,
-    Sin8 = function(z) return math.floor((math.sin(z / 255 * 2 * math.pi) + 1) / 2 * 255) end,
-    Triangle8 = function(z) z = z % 256; return z < 128 and z * 2 or (255 - z) * 2 end
+```json
+{
+  "script": "<the full Lua script as a JSON string>",
+  "pixelCount": 60,
+  "frameCount": 30
 }
 ```
 
-### Step 3: Output Analysis
+- `script` — the complete Lua script (metadata block + functions), as a JSON
+  string. Newlines and quotes MUST be properly JSON-escaped. Do NOT hand-escape;
+  build the body programmatically (e.g. `json.dumps` in Python) so escaping is correct.
+- `pixelCount` — LED count to simulate. Default **60**. Allow the user to override.
+- `frameCount` — number of frames to render. Default **30**. Allow the user to override.
 
-Check that:
-- No nil returns from onRender
-- RGB values are integers 0-255
-- HSV values are floats 0-1
-- No runtime errors across all frames and pixels
-- No infinite loops (timeout after 5 seconds)
+## How to Call It
 
-### Step 4: Common Fixes
+Use Code Interpreter to POST the script. Preferred (Python):
 
-| Error | Fix |
-|-------|-----|
-| `attempt to call nil value 'randomseed'` | Remove math.randomseed, use deterministic hash |
+```python
+import json, urllib.request
+
+script = open("effect.lua").read()          # or the in-memory script string
+body = json.dumps({"script": script, "pixelCount": 60, "frameCount": 30}).encode()
+req = urllib.request.Request(
+    "https://d1vsg15w9yes9v.cloudfront.net/api/light-effect/check-and-render",
+    data=body,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(req, timeout=60) as r:
+    resp = json.loads(r.read())
+print(json.dumps(resp, ensure_ascii=False, indent=2))
+```
+
+A ready-made helper script `validate_effect.sh` is included in this skill folder
+(uses curl + Python to build the body safely). See README.md.
+
+## Response Shapes (parse defensively)
+
+The API may return either of two shapes. **Always handle both.**
+
+**Shape 1 — nested** (`check` and optional `render`):
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "check":  { "valid": true, "errors": [], "warnings": [], "output": "校验通过" },
+    "render": { "success": true, "url": "https://d1vsg15w9yes9v.cloudfront.net/gif/effect_XXXX.gif",
+                "filePath": "...", "frameCount": 30, "pixelCount": 60, "message": "渲染成功" }
+  }
+}
+```
+
+**Shape 2 — flat** (no `render`):
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": { "valid": true, "errors": [], "warnings": [], "output": "校验通过" }
+}
+```
+
+**Parsing rules:**
+
+```
+d       = response["data"]
+check   = d["check"] if "check" in d else d
+valid   = check.get("valid")
+errors  = check.get("errors", [])
+warnings= check.get("warnings", [])
+output  = check.get("output", "")
+render  = d.get("render")                    # may be absent
+gifUrl  = render.get("url") if render else None
+```
+
+## Behavior
+
+### On success (`valid == true`)
+
+1. Tell the user **校验通过** (validation passed).
+2. If there are `warnings`, list them (the script is valid but could be improved).
+3. If a `gifUrl` is present, **return that URL to the user as a plain clickable
+   link** so they can preview the rendered GIF themselves. Do NOT download or
+   embed the GIF — just present the URL, e.g.:
+
+   > ✅ 校验通过。预览: https://d1vsg15w9yes9v.cloudfront.net/gif/effect_XXXX.gif
+
+### On failure (`valid == false`)
+
+1. Show the `output` message and list all `errors` (and any `warnings`).
+2. **Fix the script** based on the reported errors (see the common-fix table in
+   the `effect_generate` skill and `knowledge/common_mistakes.md`).
+3. Re-submit the corrected script to the API.
+4. Repeat until `valid == true` or the user stops. No hardcoded retry limit —
+   use judgment; if the same error persists after a couple of attempts, explain
+   the blocker to the user.
+
+### On HTTP / network error
+
+If the request fails (non-200 status, timeout, connection refused, malformed
+JSON), **report the failure clearly and do NOT claim the script is valid.**
+Tell the user the validation service could not be reached, so the script is
+**UNVERIFIED**, and suggest retrying. Distinguish "the service said the script
+is invalid" from "the service was unreachable" — never conflate the two, and
+NEVER fall back to a local simulation and present it as a pass.
+
+## Common Fixes (when the API reports errors)
+
+| Error signal | Fix |
+|--------------|-----|
 | `ctx:method()` colon notation | Change to `ctx.method()` dot notation |
 | `ctx.getPixelCount()` | Change to `ctx.pixelCount` |
-| RGB value > 255 or < 0 | Add `math.max(0, math.min(255, math.floor(v)))` |
-| HSV value > 1 or < 0 | Add `math.max(0, math.min(1, v))` |
+| RGB value > 255 or < 0 | Clamp: `math.max(0, math.min(255, math.floor(v)))` |
+| HSV value > 1 or < 0 | Clamp: `math.max(0, math.min(1, v))` |
 | `ctx.Time()` with float | Cast to integer: `ctx.Time(math.floor(duration))` |
-| Non-ASCII characters | Replace with ASCII equivalents |
-| Missing Color return | Ensure all code paths in onRender return Color.RGB/HSV |
-
-### Step 5: Fix and Retry
-
-If validation fails:
-1. Identify the error from the runtime output
-2. Apply the appropriate fix
-3. Re-run the test harness
-4. Repeat until passing (no hardcoded retry limit — use judgment)
+| `math.random` / `math.randomseed` / `os.*` | Not available — use `ctx.frameIndex + index` hash |
+| Missing Color return | Ensure all `onRender` paths return `Color.RGB` / `Color.HSV` |
+| Non-ASCII in code | Replace with ASCII equivalents |
+| Metadata not valid JSON on one line | Compact the `--[=[ ... --]=]` metadata to a single JSON line |
 
 ## Success Criteria
 
-Script passes when:
-- ✅ 10 frames × 100 pixels all produce valid Color output
-- ✅ No runtime errors
-- ✅ No assertion failures (RGB in 0-255, HSV in 0-1)
-- ✅ Executes within 5 second timeout
+Script passes when the API returns `valid == true`. When a render URL is
+included, hand it to the user for preview.
